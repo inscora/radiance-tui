@@ -1,6 +1,6 @@
 # radiance-tui
 
-Live [radiance](http) engine stats in the Linux console — a terminal dashboard in the
+Live [radiance](https://codeberg.org/StillDeadcode/radiance) engine stats in the Linux console — a terminal dashboard in the
 spirit of `strata monitor`, built with Rust + [ratatui](https://ratatui.rs).
 
 ![radiance-tui dashboard](docs/screen.jpg)
