@@ -241,11 +241,19 @@ impl History {
         ] {
             let held = q
                 .back()
-                .map(|&prev| (prev * 93 / 100).max(instant))
+                .map(|&prev| (prev * 90 / 100).max(instant))
                 .unwrap_or(instant);
             q.pop_front();
             q.push_back(held);
         }
+    }
+    // Tail cutoff: any sample below ~3% of the window's peak reads as a faint
+    // ▁ on the baseline and makes separate bursts bleed into one solid band;
+    // floor it to zero so bursts stay visually distinct.
+    fn window(&self, q: &VecDeque<u64>, width: usize) -> Vec<u64> {
+        let win: Vec<u64> = q.iter().rev().take(width).rev().cloned().collect();
+        let floor = win.iter().max().unwrap_or(&0) / 32;
+        win.into_iter().map(|v| if v > floor { v } else { 0 }).collect()
     }
 }
 
@@ -379,8 +387,8 @@ fn ui(
     // the LAST window_width samples; LeftToRight then puts the newest bar on
     // the right edge and fresh activity shows up immediately.
     let win = (speed[0].width.saturating_sub(2)) as usize;
-    let dec: Vec<u64> = hist.decode.iter().rev().take(win).rev().cloned().collect();
-    let pre: Vec<u64> = hist.prefill.iter().rev().take(win).rev().cloned().collect();
+    let dec = hist.window(&hist.decode, win);
+    let pre = hist.window(&hist.prefill, win);
     f.render_widget(
         Sparkline::default()
             .direction(ratatui::widgets::RenderDirection::LeftToRight)
