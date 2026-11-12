@@ -1,0 +1,31 @@
+# Maintainer: initnull <initnull@localhost>
+pkgname=radiance-tui
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Live radiance engine stats in the Linux console (ratatui dashboard, like strata monitor)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/stilldeadcode/radiance'
+license=('MIT')
+makedepends=('cargo')
+depends=('glibc' 'gcc-libs')
+options=('!debug' '!buildflags')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('cd9bef1779a2e4e5c28820a5cb3f1f13034561abc6ca543a3c7b8804530c2c67')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --offline --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --release --offline --locked || true
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  [[ -f docs/screen.jpg ]] && install -Dm644 docs/screen.jpg "$pkgdir/usr/share/doc/$pkgname/docs/screen.jpg"
+}

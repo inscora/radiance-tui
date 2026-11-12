@@ -1,0 +1,17 @@
+[package]
+name = "radiance-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Live radiance engine monitor for the Linux console, in the spirit of `strata monitor`"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+ratatui = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+strip = true
