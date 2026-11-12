@@ -1,6 +1,6 @@
 # Maintainer: initnull <initnull@localhost>
 pkgname=radiance-tui
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Live radiance engine stats in the Linux console (ratatui dashboard, like strata monitor)'
 arch=('x86_64' 'aarch64')
@@ -10,7 +10,7 @@ makedepends=('cargo')
 depends=('glibc' 'gcc-libs')
 options=('!debug' '!buildflags')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('cd9bef1779a2e4e5c28820a5cb3f1f13034561abc6ca543a3c7b8804530c2c67')
+sha256sums=('651c1db373efb58a2ab56037a44f631dd0f1f83e8df854eb7e4fbd5d7d5e2d42')
 
 build() {
   cd "$pkgname-$pkgver"

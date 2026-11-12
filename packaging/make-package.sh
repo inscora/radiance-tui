@@ -22,8 +22,8 @@ printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendore
 echo "==> staging sources -> $stage"
 rm -rf "$stage"
 mkdir -p "$(dirname "$stage")"
-cp -r --reflink=auto . "$stage"
-rm -rf "$stage/target" "$stage/packaging/src" "$stage/packaging/pkg"
+mkdir -p "$stage"
+tar -C . --exclude=./target --exclude=./.git -cf - . | tar -C "$stage" -xf -
 
 echo "==> tarball -> $tarball"
 tar --transform "s,^$name-$version,$name-$version," -czf "/tmp/$name-$version.tar.gz" -C "$(dirname "$stage")" "$(basename "$stage")"

@@ -9,7 +9,7 @@ One screen, refreshed every second:
 
 - **Header** — model, engine version, uptime, health dot (serving / stale / down),
   running / waiting / queue depth, total requests
-- **decode / prefill** — live tok/s with 2-minute sparkline history
+- **decode / prefill** — live tok/s sparklines: 4 Hz sampling with peak-hold decay, so even a few-token burst paints a visible band (60 s window)
 - **engine** — draft acceptance rate, preemptions
 - **kv cache** — utilization gauge (tokens used / capacity)
 - **cache** — carved KV VRAM, prefix & linear prefix-cache hit rates
@@ -45,7 +45,7 @@ RADIANCE_API_KEY=... ./target/release/radiance-tui --url http://10.13.37.149:808
 |-------------|-----------------------|----------------------------------|
 | `--url`     | `http://127.0.0.1:8080` | engine base URL                |
 | `--key`     | `$RADIANCE_API_KEY`   | bearer key for `/stats`          |
-| `--interval`| `1000`                | poll interval, ms                |
+| `--interval`| `250`                 | poll interval, ms                |
 | `--once`    | —                     | print one snapshot and exit      |
 
 Keys in the TUI: `q` quit · `space` freeze/resume the frame · `s` poll now.

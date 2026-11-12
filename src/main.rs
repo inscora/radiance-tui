@@ -34,7 +34,7 @@ struct Cli {
     key: String,
 
     /// Poll interval in milliseconds
-    #[arg(short, long, default_value_t = 1000)]
+    #[arg(short, long, default_value_t = 250)]
     interval: u64,
 
     /// Print one snapshot as text and exit (no TUI)
@@ -216,34 +216,35 @@ fn pct(x: f64) -> String {
 
 // ------------------------------------------------------------- render ----
 
+// Sampled ring buffers for the speed sparklines. Two tricks make short queries
+// visible: samples arrive at the poll rate (4 Hz by default, so sub-second
+// bursts aren't missed), and each new sample PEAK-HOLDS the previous one with
+// a slow decay — a one-off burst paints a visible band that fades out instead
+// of being a single 1-px column lost in a 60 s window.
 struct History {
     decode: VecDeque<u64>,
     prefill: VecDeque<u64>,
-    kv: VecDeque<u64>,
 }
 
 impl History {
     fn new() -> Self {
-        let mut h = History {
-            decode: VecDeque::new(),
-            prefill: VecDeque::new(),
-            kv: VecDeque::new(),
-        };
-        for _ in 0..120 {
-            h.decode.push_back(0);
-            h.prefill.push_back(0);
-            h.kv.push_back(0);
+        let len = 240; // 60 s at the 250 ms default poll
+        History {
+            decode: vec![0; len].into(),
+            prefill: vec![0; len].into(),
         }
-        h
     }
     fn push(&mut self, s: &Stats) {
-        for (q, v) in [
+        for (q, instant) in [
             (&mut self.decode, (s.decode_tps * 10.0) as u64),
-            (&mut self.prefill, (s.prefill_tps / 10.0) as u64),
-            (&mut self.kv, (s.kv_util * 1000.0) as u64),
+            (&mut self.prefill, s.prefill_tps as u64),
         ] {
+            let held = q
+                .back()
+                .map(|&prev| (prev * 93 / 100).max(instant))
+                .unwrap_or(instant);
             q.pop_front();
-            q.push_back(v);
+            q.push_back(held);
         }
     }
 }
@@ -374,9 +375,16 @@ fn ui(
         ])
         .split(top[1]);
 
+    // Sparkline only renders the first `width` samples it's given, so hand it
+    // the LAST window_width samples; LeftToRight then puts the newest bar on
+    // the right edge and fresh activity shows up immediately.
+    let win = (speed[0].width.saturating_sub(2)) as usize;
+    let dec: Vec<u64> = hist.decode.iter().rev().take(win).rev().cloned().collect();
+    let pre: Vec<u64> = hist.prefill.iter().rev().take(win).rev().cloned().collect();
     f.render_widget(
         Sparkline::default()
-            .data(hist.decode.iter().cloned().collect::<Vec<u64>>())
+            .direction(ratatui::widgets::RenderDirection::LeftToRight)
+            .data(dec)
             .style(Style::default().fg(Color::Green))
             .block(
                 Block::default()
@@ -387,7 +395,8 @@ fn ui(
     );
     f.render_widget(
         Sparkline::default()
-            .data(hist.prefill.iter().cloned().collect::<Vec<u64>>())
+            .direction(ratatui::widgets::RenderDirection::LeftToRight)
+            .data(pre)
             .style(Style::default().fg(Color::Blue))
             .block(
                 Block::default()

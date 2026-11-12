@@ -1,6 +1,6 @@
 [package]
 name = "radiance-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Live radiance engine monitor for the Linux console, in the spirit of `strata monitor`"
 homepage = "https://codeberg.org/StillDeadcode/radiance"
