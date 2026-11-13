@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table,
+    Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Wrap,
 };
 use ratatui::Frame;
 use serde::Deserialize;
@@ -330,7 +330,12 @@ fn ui(
     hist: &History,
     paused: bool,
     last_ok: Option<Instant>,
+    help: bool,
 ) {
+    if help {
+        render_help(f);
+        return;
+    }
     if snap.stats.is_none() {
         // Nothing parsed yet: health banner or a modal error box.
         let msg = if snap.need_key {
@@ -438,7 +443,7 @@ fn ui(
     // Sparkline only renders the first `width` samples it's given, so hand it
     // the LAST window_width samples; LeftToRight then puts the newest bar on
     // the right edge and fresh activity shows up immediately.
-    let win = (speed[0].width.saturating_sub(2)) as usize;
+    let win = (gfx[0].width.saturating_sub(2)) as usize;
     let dec = hist.window(&hist.decode, win);
     let pre = hist.window(&hist.prefill, win);
     f.render_widget(
@@ -696,9 +701,69 @@ fn ui(
             " freeze frame "
         }),
         Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(" poll now "),
+        Span::raw(" poll now   "),
+        Span::styled(" h ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(" help "),
     ]));
     f.render_widget(foot, top[4]);
+}
+
+// ------------------------------------------------------- help overlay ----
+
+fn render_help(f: &mut Frame) {
+    // Fits a 24-row terminal: border (2) + 22 content rows.
+    fn lb(t: &str) -> Span<'_> {
+        Span::styled(t, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))
+    }
+    let lines: Vec<Line> = vec![
+        Line::from(vec![
+            lb(" keys     "),
+            Span::raw("h help · space freeze/resume · s poll now · q quit · esc close/quit"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            lb(" top      "),
+            Span::raw("decode/prefill: live tok/s, 60 s window; peak-hold w/ decay so"),
+        ]),
+        Line::from("          short bursts stay visible; title = current rate"),
+        Line::from("          kv: KV-cache utilisation gauge (token budget in use)"),
+        Line::from(""),
+        Line::from(vec![
+            lb(" mid row  "),
+            Span::raw("engine: draft accept = speculative-decode acceptance rate"),
+        ]),
+        Line::from("          step = per-decode-token latency (recent / best)"),
+        Line::from("          prefill capped > 0 = engine throttling prefill (yellow)"),
+        Line::from("          cache: prefix/linear hit rates; evictions = cache pressure"),
+        Line::from("          experts (MoE): per-layer experts, HBM promote/demote, starved slab"),
+        Line::from("          throughput (dense): live prompt/output tok + running averages"),
+        Line::from("          over active samples only — idle time excluded"),
+        Line::from(""),
+        Line::from(vec![
+            lb(" bottom   "),
+            Span::raw("cards: per-GPU VRAM usage bars (used / carved)"),
+        ]),
+        Line::from("          requests: one row per in-flight request"),
+        Line::from("          state: decode=green prefill=blue waiting=yellow"),
+        Line::from("          prompt=inputs · cached=from cache · out/max=generated/cap"),
+        Line::from("          ctx|comp=context|computed · kv=kv tokens · tps=tokens/s"),
+        Line::from("          ttft=time to first token · pre=prefill time · age=since start"),
+        Line::from(vec![
+            lb(" header   "),
+            Span::raw("up=uptime · boot=startup time · reqs=total since start"),
+        ]),
+        Line::from("          running/waiting=active/queued · queue=in-flight/capacity"),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" help — h or Esc to close "),
+            )
+            .wrap(Wrap { trim: true }),
+        f.area(),
+    );
 }
 
 // --------------------------------------------------------------- main ----
@@ -733,8 +798,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ratatui::run(|terminal| {
         let mut snap = Snapshot::default();
         let mut hist = History::new();
-        let mut paused = false;
-        let mut last_ok: Option<Instant> = None;
+    let mut paused = false;
+    let mut help = false;
+    let mut last_ok: Option<Instant> = None;
         loop {
             // Drain to the newest frame (old frames would only lag).
             while let Ok(s) = rx.try_recv() {
@@ -750,7 +816,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            terminal.draw(|f| ui(f, &snap, &hist, paused, last_ok))?;
+            terminal.draw(|f| ui(f, &snap, &hist, paused, last_ok, help))?;
 
             let wait = if paused {
                 Duration::from_millis(200)
@@ -760,7 +826,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if help {
+                                help = false;
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('h') => help = !help,
                         KeyCode::Char(' ') => paused = !paused,
                         KeyCode::Char('s') => poll(&client, &cli, &tx),
                         _ => {}

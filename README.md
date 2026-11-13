@@ -54,7 +54,7 @@ different port, only the port changes: `--url http://<host>:9090`.
 | `--interval`| `250`                 | poll interval, ms                |
 | `--once`    | —                     | print one snapshot and exit      |
 
-Keys in the TUI: `q` quit · `space` freeze/resume the frame · `s` poll now.
+Keys in the TUI: `q` quit · `space` freeze/resume the frame · `s` poll now · `h` help (explains every panel and value; `Esc` closes it first).
 
 ## Data sources
 
