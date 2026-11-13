@@ -13,7 +13,10 @@ One screen, refreshed every second:
 - **engine** — draft acceptance rate, preemptions
 - **kv cache** — utilization gauge (tokens used / capacity)
 - **cache** — carved KV VRAM, prefix & linear prefix-cache hit rates
-- **experts** — MoE layer×expert residency, promote/demote churn, starved slab
+- **experts / throughput** — MoE models: layer×expert residency, promote/demote
+  churn, starved slab. Dense models (no `experts` in `/stats`): live
+  prompt/output token totals, avg TTFT, and average prefill & decode
+  tok/s (averaged over active time only — zero-rate samples are excluded)
 - **cards** — per-GPU VRAM bars
 - **requests** — live table: state, slot, prompt/cached/output tokens, ctx,
   TTFT, prefill time, per-request tok/s, age (color-coded by state)
@@ -41,14 +44,17 @@ RADIANCE_API_KEY=... ./target/release/radiance-tui --url http://10.13.37.149:808
 ./target/release/radiance-tui --url ... --key ... --once
 ```
 
+The port is just part of `--url` — the default is 8080. To target a
+different port, only the port changes: `--url http://<host>:9090`.
+
 | flag        | default               | meaning                          |
 |-------------|-----------------------|----------------------------------|
-| `--url`     | `http://127.0.0.1:8080` | engine base URL                |
+| `--url`     | `http://127.0.0.1:8080` | engine base URL (default port 8080) |
 | `--key`     | `$RADIANCE_API_KEY`   | bearer key for `/stats`          |
 | `--interval`| `250`                 | poll interval, ms                |
 | `--once`    | —                     | print one snapshot and exit      |
 
-Keys in the TUI: `q` quit · `space` freeze/resume the frame · `s` poll now.
+Keys in the TUI: `q` quit · `space` freeze/resume the frame · `s` poll now · `h` help (explains every panel and value; `Esc` closes it first).
 
 ## Data sources
 

@@ -16,7 +16,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{
+    Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Wrap,
+};
 use ratatui::Frame;
 use serde::Deserialize;
 
@@ -121,6 +123,16 @@ struct Stats {
     draft_accept: f64,
     preemptions: u64,
     total_requests: u64,
+    #[serde(default)]
+    startup_s: f64,
+    #[serde(default)]
+    step_ns_decode_recent: f64,
+    #[serde(default)]
+    step_ns_decode_best: f64,
+    #[serde(default)]
+    prefix_evictions: f64,
+    #[serde(default)]
+    prefill_chunks_capped: f64,
     cards: Vec<Card>,
     requests: Vec<ReqRow>,
     #[serde(default)]
@@ -137,41 +149,34 @@ struct Snapshot {
 
 // ------------------------------------------------------------- poller ----
 
-fn poll(cli: &Cli, tx: &mpsc::Sender<Snapshot>) {
-    let agent = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build();
-    let agent = match agent {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(Snapshot {
-                error: Some(format!("http client: {e}")),
-                ..Default::default()
-            });
-            return;
-        }
-    };
-
+fn poll(client: &reqwest::blocking::Client, cli: &Cli, tx: &mpsc::Sender<Snapshot>) {
     let mut snap = Snapshot::default();
 
     // /health needs no key and tells us the engine is there even before auth.
-    match agent.get(format!("{}/health", cli.url)).send() {
-        Ok(r) => match r.json::<Health>() {
-            Ok(h) => snap.health = Some(h),
-            Err(e) => snap.error = Some(format!("/health: {e}")),
+    // Decode via text() so serde's exact error (field + type) reaches the UI.
+    match client.get(format!("{}/health", cli.url)).send() {
+        Ok(r) => match r.text() {
+            Ok(body) => match serde_json::from_str::<Health>(&body) {
+                Ok(h) => snap.health = Some(h),
+                Err(e) => snap.error = Some(format!("/health: {e}")),
+            },
+            Err(e) => snap.error = Some(format!("{}/health: {e}", cli.url)),
         },
         Err(e) => snap.error = Some(format!("{}/health: {e}", cli.url)),
     }
 
-    let mut req = agent.get(format!("{}/stats", cli.url));
+    let mut req = client.get(format!("{}/stats", cli.url));
     if !cli.key.is_empty() {
         req = req.bearer_auth(&cli.key);
     }
     match req.send() {
         Ok(r) if r.status().as_u16() == 401 => snap.need_key = true,
-        Ok(r) => match r.json::<Stats>() {
-            Ok(s) => snap.stats = Some(s),
-            Err(e) => snap.error = Some(format!("/stats: {e}")),
+        Ok(r) => match r.text() {
+            Ok(body) => match serde_json::from_str::<Stats>(&body) {
+                Ok(s) => snap.stats = Some(s),
+                Err(e) => snap.error = Some(format!("/stats: {e}")),
+            },
+            Err(e) => snap.error = Some(format!("{}/stats: {e}", cli.url)),
         },
         Err(e) => snap.error = Some(format!("{}/stats: {e}", cli.url)),
     }
@@ -214,6 +219,16 @@ fn pct(x: f64) -> String {
     format!("{:.1}%", x * 100.0)
 }
 
+fn human_ns(ns: f64) -> String {
+    if ns >= 1_000_000.0 {
+        format!("{:.1}ms", ns / 1_000_000.0)
+    } else if ns >= 1_000.0 {
+        format!("{:.0}µs", ns / 1_000.0)
+    } else {
+        format!("{:.0}ns", ns)
+    }
+}
+
 // ------------------------------------------------------------- render ----
 
 // Sampled ring buffers for the speed sparklines. Two tricks make short queries
@@ -224,6 +239,10 @@ fn pct(x: f64) -> String {
 struct History {
     decode: VecDeque<u64>,
     prefill: VecDeque<u64>,
+    prefill_sum: f64,
+    prefill_n: u64,
+    decode_sum: f64,
+    decode_n: u64,
 }
 
 impl History {
@@ -232,6 +251,10 @@ impl History {
         History {
             decode: vec![0; len].into(),
             prefill: vec![0; len].into(),
+            prefill_sum: 0.0,
+            prefill_n: 0,
+            decode_sum: 0.0,
+            decode_n: 0,
         }
     }
     fn push(&mut self, s: &Stats) {
@@ -245,6 +268,30 @@ impl History {
                 .unwrap_or(instant);
             q.pop_front();
             q.push_back(held);
+        }
+        // Averages are over active samples only (rate > 0), so idle time
+        // doesn't dilute them.
+        if s.prefill_tps > 0.0 {
+            self.prefill_sum += s.prefill_tps;
+            self.prefill_n += 1;
+        }
+        if s.decode_tps > 0.0 {
+            self.decode_sum += s.decode_tps;
+            self.decode_n += 1;
+        }
+    }
+    fn avg_prefill_tps(&self) -> f64 {
+        if self.prefill_n > 0 {
+            self.prefill_sum / self.prefill_n as f64
+        } else {
+            0.0
+        }
+    }
+    fn avg_decode_tps(&self) -> f64 {
+        if self.decode_n > 0 {
+            self.decode_sum / self.decode_n as f64
+        } else {
+            0.0
         }
     }
     // Tail cutoff: any sample below ~3% of the window's peak reads as a faint
@@ -283,7 +330,12 @@ fn ui(
     hist: &History,
     paused: bool,
     last_ok: Option<Instant>,
+    help: bool,
 ) {
+    if help {
+        render_help(f);
+        return;
+    }
     if snap.stats.is_none() {
         // Nothing parsed yet: health banner or a modal error box.
         let msg = if snap.need_key {
@@ -336,10 +388,10 @@ fn ui(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // header
-            Constraint::Length(6),  // speed + drafts
-            Constraint::Length(7),  // kv + caches
-            Constraint::Min(7),     // cards / experts / requests
-            Constraint::Length(1),  // footer
+            Constraint::Min(10),   // graphics: sparklines + kv gauge (shares extra space)
+            Constraint::Length(7), // text: engine / cache / throughput
+            Constraint::Min(10),   // cards + requests (shares extra space equally)
+            Constraint::Length(1), // footer
         ])
         .split(f.area());
 
@@ -363,8 +415,13 @@ fn ui(
         Span::styled(format!("v{}  ", s.version), Style::default().fg(Color::DarkGray)),
         engine,
         Span::raw(format!(
-            "  up {}  reqs {}  running {}  waiting {}  queue {}",
+            "  up {}{}  reqs {}  running {}  waiting {}  queue {}",
             human_uptime(s.uptime_s),
+            if s.startup_s > 0.0 {
+                format!("  boot {:.0}s", s.startup_s)
+            } else {
+                String::new()
+            },
             s.total_requests,
             s.running,
             s.waiting,
@@ -373,8 +430,8 @@ fn ui(
     ]));
     f.render_widget(hdr.block(Block::default().borders(Borders::ALL).title(" radiance ")), top[0]);
 
-    // ---- speed row ----
-    let speed = Layout::default()
+    // ---- graphics row ----
+    let gfx = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(40),
@@ -386,7 +443,7 @@ fn ui(
     // Sparkline only renders the first `width` samples it's given, so hand it
     // the LAST window_width samples; LeftToRight then puts the newest bar on
     // the right edge and fresh activity shows up immediately.
-    let win = (speed[0].width.saturating_sub(2)) as usize;
+    let win = (gfx[0].width.saturating_sub(2)) as usize;
     let dec = hist.window(&hist.decode, win);
     let pre = hist.window(&hist.prefill, win);
     f.render_widget(
@@ -399,7 +456,7 @@ fn ui(
                     .borders(Borders::ALL)
                     .title(format!(" decode {:.0} tok/s ", s.decode_tps)),
             ),
-        speed[0],
+        gfx[0],
     );
     f.render_widget(
         Sparkline::default()
@@ -411,20 +468,11 @@ fn ui(
                     .borders(Borders::ALL)
                     .title(format!(" prefill {:.0} tok/s ", s.prefill_tps)),
             ),
-        speed[1],
-    );
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(" draft accept   {}", pct(s.draft_accept))),
-            Line::from(format!(" preemptions    {}", s.preemptions)),
-            Line::from(format!(" preempted now  {}", s.preempted)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(" engine ")),
-        speed[2],
+        gfx[1],
     );
 
-    // ---- kv + cache row ----
-    let mid = Layout::default()
+    // ---- text row ----
+    let txt = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(40),
@@ -432,6 +480,28 @@ fn ui(
             Constraint::Percentage(30),
         ])
         .split(top[2]);
+
+    let mut eng_lines = vec![Line::from(format!(" draft accept   {}", pct(s.draft_accept)))];
+    if s.step_ns_decode_recent > 0.0 {
+        eng_lines.push(Line::from(format!(
+            " step {} (best {})",
+            human_ns(s.step_ns_decode_recent),
+            human_ns(s.step_ns_decode_best)
+        )));
+    }
+    eng_lines.push(Line::from(format!(" preemptions    {}", s.preemptions)));
+    eng_lines.push(Line::from(format!(" preempted now  {}", s.preempted)));
+    if s.prefill_chunks_capped > 0.0 {
+        eng_lines.push(
+            Line::from(format!(" prefill capped {}", s.prefill_chunks_capped))
+                .style(Style::default().fg(Color::Yellow)),
+        );
+    }
+    f.render_widget(
+        Paragraph::new(eng_lines)
+            .block(Block::default().borders(Borders::ALL).title(" engine ")),
+        txt[0],
+    );
 
     let kv_ratio = s.kv_util.clamp(0.0, 1.0);
     let kv_color = match kv_ratio {
@@ -450,7 +520,7 @@ fn ui(
                 pct(s.kv_util)
             ))
             .block(Block::default().borders(Borders::ALL).title(" kv cache ")),
-        mid[0],
+        gfx[2],
     );
     f.render_widget(
         Paragraph::new(vec![
@@ -461,34 +531,66 @@ fn ui(
             )),
             Line::from(format!(" prefix hit    {}", pct(s.prefix_hit_rate))),
             Line::from(format!(" linear hit    {}", pct(s.linear_hit_rate))),
+            Line::from(format!(" evictions     {}", s.prefix_evictions)),
         ])
         .block(Block::default().borders(Borders::ALL).title(" cache ")),
-        mid[1],
+        txt[1],
     );
-    let resident = s
-        .experts
-        .n_experts
-        .saturating_mul(s.experts.n_layers);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                " experts {}×{} ({} total)",
-                s.experts.n_layers, s.experts.n_experts, resident
-            )),
-            Line::from(format!(
-                " promote {} / demote {}",
-                s.experts.promotions, s.experts.demotions
-            )),
-            Line::from(format!(" starved slab  {}", s.experts.starved_slab)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(" experts ")),
-        mid[2],
-    );
+    if s.experts.n_experts > 0 {
+        let resident = s
+            .experts
+            .n_experts
+            .saturating_mul(s.experts.n_layers);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    " experts {}×{} ({} total)",
+                    s.experts.n_layers, s.experts.n_experts, resident
+                )),
+                Line::from(format!(
+                    " promote {} / demote {}",
+                    s.experts.promotions, s.experts.demotions
+                )),
+                Line::from(format!(" starved slab  {}", s.experts.starved_slab)),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" experts ")),
+            txt[2],
+        );
+    } else {
+        let mut prompt_tok = 0u64;
+        let mut output_tok = 0u64;
+        let mut ttft_sum = 0.0;
+        let mut ttft_n = 0u64;
+        for r in &s.requests {
+            prompt_tok += r.prompt;
+            output_tok += r.output;
+            if let Some(t) = r.ttft_s {
+                ttft_sum += t;
+                ttft_n += 1;
+            }
+        }
+        let avg_ttft = if ttft_n > 0 {
+            ttft_sum / ttft_n as f64
+        } else {
+            0.0
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(" live prompt  {prompt_tok} tok")),
+                Line::from(format!(" live output  {output_tok} tok")),
+                Line::from(format!(" avg ttft     {avg_ttft:.2}s")),
+                Line::from(format!(" avg prefill  {:.0} tok/s", hist.avg_prefill_tps())),
+                Line::from(format!(" avg decode   {:.0} tok/s", hist.avg_decode_tps())),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" throughput ")),
+            txt[2],
+        );
+    }
 
     // ---- cards + requests ----
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(top[3]);
 
     let mut card_lines = Vec::new();
@@ -498,7 +600,8 @@ fn ui(
         } else {
             0.0
         };
-        let filled = (r * 28.0).round() as usize;
+        // Clamp: a bar over 100% (odd engine reports) must not underflow 28 - filled.
+        let filled = (r.clamp(0.0, 1.0) * 28.0).round() as usize;
         let bar: String = format!("{}{}", "█".repeat(filled), "░".repeat(28 - filled));
         card_lines.push(Line::from(format!(" #{} {}", c.index, c.name)));
         card_lines.push(Line::from(Span::styled(
@@ -532,7 +635,7 @@ fn ui(
         .iter()
         .map(|r| {
             let state_style = match r.state.as_str() {
-                "running" | "decoding" => Style::default().fg(Color::Green),
+                "running" | "decoding" | "decode" => Style::default().fg(Color::Green),
                 "prefill" => Style::default().fg(Color::Blue),
                 "waiting" | "queued" => Style::default().fg(Color::Yellow),
                 "done" => Style::default().fg(Color::DarkGray),
@@ -598,19 +701,85 @@ fn ui(
             " freeze frame "
         }),
         Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(" poll now "),
+        Span::raw(" poll now   "),
+        Span::styled(" h ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(" help "),
     ]));
     f.render_widget(foot, top[4]);
+}
+
+// ------------------------------------------------------- help overlay ----
+
+fn render_help(f: &mut Frame) {
+    // Fits a 24-row terminal: border (2) + 22 content rows.
+    fn lb(t: &str) -> Span<'_> {
+        Span::styled(t, Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))
+    }
+    let lines: Vec<Line> = vec![
+        Line::from(vec![
+            lb(" keys     "),
+            Span::raw("h help · space freeze/resume · s poll now · q quit · esc close/quit"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            lb(" top      "),
+            Span::raw("decode/prefill: live tok/s, 60 s window; peak-hold w/ decay so"),
+        ]),
+        Line::from("          short bursts stay visible; title = current rate"),
+        Line::from("          kv: KV-cache utilisation gauge (token budget in use)"),
+        Line::from(""),
+        Line::from(vec![
+            lb(" mid row  "),
+            Span::raw("engine: draft accept = speculative-decode acceptance rate"),
+        ]),
+        Line::from("          step = per-decode-token latency (recent / best)"),
+        Line::from("          prefill capped > 0 = engine throttling prefill (yellow)"),
+        Line::from("          cache: prefix/linear hit rates; evictions = cache pressure"),
+        Line::from("          experts (MoE): per-layer experts, HBM promote/demote, starved slab"),
+        Line::from("          throughput (dense): live prompt/output tok + running averages"),
+        Line::from("          over active samples only — idle time excluded"),
+        Line::from(""),
+        Line::from(vec![
+            lb(" bottom   "),
+            Span::raw("cards: per-GPU VRAM usage bars (used / carved)"),
+        ]),
+        Line::from("          requests: one row per in-flight request"),
+        Line::from("          state: decode=green prefill=blue waiting=yellow"),
+        Line::from("          prompt=inputs · cached=from cache · out/max=generated/cap"),
+        Line::from("          ctx|comp=context|computed · kv=kv tokens · tps=tokens/s"),
+        Line::from("          ttft=time to first token · pre=prefill time · age=since start"),
+        Line::from(vec![
+            lb(" header   "),
+            Span::raw("up=uptime · boot=startup time · reqs=total since start"),
+        ]),
+        Line::from("          running/waiting=active/queued · queue=in-flight/capacity"),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" help — h or Esc to close "),
+            )
+            .wrap(Wrap { trim: true }),
+        f.area(),
+    );
 }
 
 // --------------------------------------------------------------- main ----
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // One client for the whole run: reuses the TCP/TLS connection across polls.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    // Guard against --interval 0 spinning the poller and the event loop.
+    let interval = cli.interval.max(100);
 
     if cli.once {
         let (tx, rx) = mpsc::channel();
-        poll(&cli, &tx);
+        poll(&client, &cli, &tx);
         let snap = rx.recv_timeout(Duration::from_secs(8))?;
         return print_once(&snap);
     }
@@ -618,18 +787,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx0, rx) = mpsc::channel::<Snapshot>();
     let tx = tx0.clone();
     thread::spawn({
+        let client = client.clone();
         let cli = cli.clone();
         move || loop {
-            poll(&cli, &tx0);
-            thread::sleep(Duration::from_millis(cli.interval));
+            poll(&client, &cli, &tx0);
+            thread::sleep(Duration::from_millis(interval));
         }
     });
 
     ratatui::run(|terminal| {
         let mut snap = Snapshot::default();
         let mut hist = History::new();
-        let mut paused = false;
-        let mut last_ok: Option<Instant> = None;
+    let mut paused = false;
+    let mut help = false;
+    let mut last_ok: Option<Instant> = None;
         loop {
             // Drain to the newest frame (old frames would only lag).
             while let Ok(s) = rx.try_recv() {
@@ -645,19 +816,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            terminal.draw(|f| ui(f, &snap, &hist, paused, last_ok))?;
+            terminal.draw(|f| ui(f, &snap, &hist, paused, last_ok, help))?;
 
             let wait = if paused {
                 Duration::from_millis(200)
             } else {
-                Duration::from_millis(cli.interval.min(250))
+                Duration::from_millis(interval.min(250))
             };
             if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if help {
+                                help = false;
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('h') => help = !help,
                         KeyCode::Char(' ') => paused = !paused,
-                        KeyCode::Char('s') => poll(&cli, &tx),
+                        KeyCode::Char('s') => poll(&client, &cli, &tx),
                         _ => {}
                     },
                     _ => {}
@@ -695,14 +874,23 @@ fn print_once(snap: &Snapshot) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         writeln!(
             w,
-            "        kv {} tokens {}/{} vram {}/{} prefix_hit={} linear_hit={}",
+            "        kv {} tokens {}/{} vram {}/{} prefix_hit={} linear_hit={} evictions={}",
             pct(s.kv_util),
             s.kv_tokens_used,
             s.kv_tokens_total,
             human_bytes(s.kv_bytes_used),
             human_bytes(s.kv_bytes_carved),
             pct(s.prefix_hit_rate),
-            pct(s.linear_hit_rate)
+            pct(s.linear_hit_rate),
+            s.prefix_evictions
+        )?;
+        writeln!(
+            w,
+            "        boot={:.0}s step={} (best {}) prefill_capped={}",
+            s.startup_s,
+            human_ns(s.step_ns_decode_recent),
+            human_ns(s.step_ns_decode_best),
+            s.prefill_chunks_capped
         )?;
         for c in &s.cards {
             writeln!(
